@@ -19,6 +19,7 @@
 #include <limits.h>
 
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <elf.h>
 
@@ -179,6 +180,210 @@ static inline uintptr_t _page_start(uintptr_t addr) {
 static inline uintptr_t _page_end(uintptr_t addr) {
   return ALIGN_DOWN(addr + system_page_size - 1, system_page_size);
 }
+
+/* INFO: The "NoHello" syscall 244 exposes VMA-invisible memory: allocations made
+          through it do not appear in /proc/<pid>/maps, smaps or pagemap. It only
+          exists on patched AArch64 kernels; on a stock kernel syscall number 244
+          is unassigned and returns -ENOSYS, and on other architectures it maps to
+          an unrelated syscall, so the whole feature is gated to __aarch64__.
+
+          When available, a manually loaded library is moved into this hidden
+          memory in its entirety: every PT_LOAD segment is recreated at its
+          original address in hidden memory and the whole reserved span is dropped
+          in one munmap, so not even a gap remains in the maps. When unavailable,
+          on a stock kernel, or on non-AArch64 builds, the library keeps its
+          normal mappings, which is the legacy behaviour.
+
+          img->header is a heap copy of the whole ELF file (not a pointer into the
+          mapping), so reading program headers stays valid even after the mapped
+          segments are unmapped. */
+#ifdef __aarch64__
+  #define NH_SYSCALL_NR   244
+  #define NH_CMD_HELLO    0
+  #define NH_CMD_MMAP     2
+  #define NH_CMD_MPROTECT 3
+  #define NH_CMD_MUNMAP   4
+
+  /* INFO: -1 unknown, 0 unavailable, 1 available. Probed once and cached. */
+  static int nohello_availability = -1;
+
+  static bool _nohello_available(void) {
+    if (nohello_availability != -1) return nohello_availability == 1;
+
+    /* INFO: CMD 0 (hello) is a harmless debug command that returns 0 when the
+              syscall is served. Anything else (e.g. -ENOSYS, permission errors)
+              means it cannot be relied upon, so we fall back. */
+    long ret = syscall(NH_SYSCALL_NR, NH_CMD_HELLO);
+    nohello_availability = ret == 0 ? 1 : 0;
+
+    if (nohello_availability == 1) LOGD("NoHello syscall 244 available: hiding loaded libraries");
+    else LOGD("NoHello syscall 244 unavailable (ret %ld): libraries kept as normal mappings", ret);
+
+    return nohello_availability == 1;
+  }
+
+  static int _phdr_seg_prot(const ElfW(Phdr) *phdr) {
+    return (phdr->p_flags & PF_R ? PROT_READ : 0) |
+           (phdr->p_flags & PF_W ? PROT_WRITE : 0) |
+           (phdr->p_flags & PF_X ? PROT_EXEC : 0);
+  }
+
+  struct nh_segment {
+    uintptr_t page_start;
+    size_t size;
+    int prot;
+    void *snapshot;
+  };
+
+  static void _linker_hide_library(struct csoloader_elf *img) {
+    if (!img || !img->header || !_nohello_available()) return;
+
+    ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
+    uintptr_t load_bias = (uintptr_t)img->base - (uintptr_t)img->bias;
+    int phnum = img->header->e_phnum;
+
+    struct nh_segment *segs = malloc((size_t)phnum * sizeof(struct nh_segment));
+    if (!segs) {
+      LOGW("Failed to allocate segment list to hide %s", img->elf);
+
+      return;
+    }
+
+    /* INFO: Snapshot every PT_LOAD segment (fully relocated, with RELRO already
+              applied) before touching any mapping, since the whole span is
+              unmapped below and hidden memory is anonymous, so the bytes have to
+              be copied back by hand. The span covers every segment plus any
+              padding between them. */
+    uintptr_t span_start = UINTPTR_MAX, span_end = 0;
+    size_t count = 0;
+    bool snapshot_failed = false;
+    for (int i = 0; i < phnum; i++) {
+      if (phdr[i].p_type != PT_LOAD) continue;
+
+      uintptr_t page_start = _page_start(phdr[i].p_vaddr + load_bias);
+      uintptr_t page_end = _page_end(phdr[i].p_vaddr + phdr[i].p_memsz + load_bias);
+      if (page_end == page_start) continue;
+
+      void *snapshot = malloc(page_end - page_start);
+      if (!snapshot) {
+        LOGW("Failed to snapshot segment %d of %s while hiding", i, img->elf);
+
+        snapshot_failed = true;
+
+        break;
+      }
+      memcpy(snapshot, (void *)page_start, page_end - page_start);
+
+      segs[count].page_start = page_start;
+      segs[count].size = page_end - page_start;
+      segs[count].prot = _phdr_seg_prot(&phdr[i]);
+      segs[count].snapshot = snapshot;
+      count++;
+
+      if (page_start < span_start) span_start = page_start;
+      if (page_end > span_end) span_end = page_end;
+    }
+
+    if (snapshot_failed || count == 0) {
+      for (size_t i = 0; i < count; i++) free(segs[i].snapshot);
+      free(segs);
+
+      return;
+    }
+
+    /* INFO: Drop the entire library span in one call: this removes every segment
+              mapping plus any inter-segment padding, so nothing of the library -
+              not even a hole - is left visible in /proc/<pid>/maps. */
+    if (munmap((void *)span_start, span_end - span_start) != 0) {
+      LOGW("Failed to unmap library span of %s before hiding: %s", img->elf, strerror(errno));
+
+      for (size_t i = 0; i < count; i++) free(segs[i].snapshot);
+      free(segs);
+
+      return;
+    }
+
+    /* INFO: Recreate each segment in hidden memory at its original address. The
+              range was just freed, so the kernel should hand back the exact
+              address; if it does not, the bias would be wrong, so that segment
+              falls back to a normal (visible) mapping to stay functional. */
+    for (size_t i = 0; i < count; i++) {
+      uintptr_t page_start = segs[i].page_start;
+      size_t size = segs[i].size;
+
+      long hidden = syscall(NH_SYSCALL_NR, NH_CMD_MMAP, (unsigned long)page_start, (unsigned long)size, 0UL, 0UL, (unsigned long)(PROT_READ | PROT_WRITE));
+      if (hidden < 0 || (uintptr_t)hidden != page_start) {
+        if (hidden >= 0) syscall(NH_SYSCALL_NR, NH_CMD_MUNMAP, (unsigned long)hidden);
+
+        void *restored = mmap((void *)page_start, size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (restored == MAP_FAILED) {
+          LOGE("Failed to restore segment of %s at %p after hiding failed: %s", img->elf, (void *)page_start, strerror(errno));
+
+          free(segs[i].snapshot);
+
+          continue;
+        }
+
+        memcpy(restored, segs[i].snapshot, size);
+        free(segs[i].snapshot);
+
+        if (mprotect(restored, size, segs[i].prot) != 0)
+          LOGW("Failed to restore protection of segment of %s at %p: %s", img->elf, (void *)page_start, strerror(errno));
+
+        LOGW("Could not hide segment of %s at %p, kept as normal mapping", img->elf, (void *)page_start);
+
+        continue;
+      }
+
+      memcpy((void *)page_start, segs[i].snapshot, size);
+      free(segs[i].snapshot);
+
+      if (syscall(NH_SYSCALL_NR, NH_CMD_MPROTECT, (unsigned long)page_start, (unsigned long)size, (unsigned long)segs[i].prot) < 0)
+        LOGW("Failed to set protection on hidden segment of %s at %p", img->elf, (void *)page_start);
+    }
+
+    /* INFO: RELRO is a sub-range of the writable data segment, so the protection
+              must be re-applied through syscall 244 (a normal mprotect cannot
+              touch hidden memory). This is the only operation that relies on a
+              sub-range CMD 3 mprotect within a hidden region. */
+    for (int i = 0; i < phnum; i++) {
+      if (phdr[i].p_type != PT_GNU_RELRO) continue;
+
+      uintptr_t relro_start = _page_start(phdr[i].p_vaddr + load_bias);
+      uintptr_t relro_end = _page_end(phdr[i].p_vaddr + phdr[i].p_memsz + load_bias);
+      if (relro_end == relro_start) continue;
+
+      if (syscall(NH_SYSCALL_NR, NH_CMD_MPROTECT, (unsigned long)relro_start, (unsigned long)(relro_end - relro_start), (unsigned long)PROT_READ) < 0)
+        LOGW("Failed to re-apply RELRO on hidden %s at %p", img->elf, (void *)relro_start);
+    }
+
+    free(segs);
+
+    LOGD("Hid library %s (%zu segments) in syscall-244 memory", img->elf, count);
+  }
+
+  static void _linker_unhide_library(struct csoloader_elf *img) {
+    if (!img || !img->header || !_nohello_available()) return;
+
+    ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
+    uintptr_t load_bias = (uintptr_t)img->base - (uintptr_t)img->bias;
+    int phnum = img->header->e_phnum;
+
+    /* INFO: Frees the hidden mapping of each segment. Segments that fell back to
+              a normal mapping are not tracked by NoHello and return an error here,
+              which is expected and ignored: the caller's munmap of the reserved
+              range reclaims those. */
+    for (int i = 0; i < phnum; i++) {
+      if (phdr[i].p_type != PT_LOAD) continue;
+
+      uintptr_t page_start = _page_start(phdr[i].p_vaddr + load_bias);
+      syscall(NH_SYSCALL_NR, NH_CMD_MUNMAP, (unsigned long)page_start);
+    }
+  }
+#else
+  #define _linker_hide_library(img) ((void)(img))
+  #define _linker_unhide_library(img) ((void)(img))
+#endif /* __aarch64__ */
 
 #ifdef __LP64__
   /* INFO: Pick the start of the highest parsed 4GiB+ gap so the mapping stays
@@ -537,6 +742,12 @@ static void _linker_release_dependency(struct linker *linker, int index, bool un
   size_t dep_map_size = dep->map_size;
 
   _linker_unregister_tls_segment(dep);
+
+  /* INFO: Free the hidden mappings before the image is destroyed, as the bulk
+             munmap below cannot reclaim VMA-invisible memory. Only on unload of a
+             manually loaded dependency, matching the munmap condition. */
+  if (unload && dep->is_manual_load) _linker_unhide_library(dep->img);
+
   csoloader_elf_destroy(dep->img);
   dep->img = NULL;
   dep->map_size = 0;
@@ -571,6 +782,11 @@ void linker_destroy(struct linker *linker) {
   _linker_unregister(linker);
 
   _linker_unregister_tls_segment((struct loaded_dep *)linker);
+
+  /* INFO: Hidden segments are not VMA-tracked, so the munmap below cannot reclaim
+             them. Free them through syscall 244 while the image is still valid. */
+  _linker_unhide_library(linker->img);
+
   csoloader_elf_destroy(linker->img);
   linker->img = NULL;
 
@@ -2300,6 +2516,18 @@ bool linker_link(struct linker *linker) {
     }
 
     register_eh_frame_for_library(dep->img);
+  }
+
+  /* INFO: Move each manually loaded library into syscall-244 hidden memory now
+             that relocations are done and protections are restored, and before
+             the constructors run so they too execute from the hidden mapping.
+             This is a no-op on non-AArch64 builds or when the syscall is
+             unavailable, in which case the libraries keep their normal mappings. */
+  _linker_hide_library(linker->img);
+  for (int i = 0; i < linker->dep_count; i++) {
+    if (!linker->dependencies[i].is_manual_load) continue;
+
+    _linker_hide_library(linker->dependencies[i].img);
   }
 
   /* INFO: preinit only is for the main EXECUTABLE. We don't deal with those, not for now, as
