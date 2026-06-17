@@ -31,6 +31,11 @@ struct csoloader_elf {
   ElfW(Ehdr) *header;
   size_t size;
   off_t bias;
+
+  /* INFO: true once the image has been moved into NoHello syscall-244 hidden
+             memory (csoloader_hide), so unload frees it via CMD_MUNMAP */
+  bool is_hidden;
+
   ElfW(Shdr) *section_header;
 
   ElfW(Shdr) *dynsym;

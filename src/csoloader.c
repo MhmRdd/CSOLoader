@@ -96,8 +96,16 @@ bool csoloader_abandon(struct csoloader *lib) {
   linker_abandon(&lib->linker);
 
   free(lib->lib_path);
-  
+
   memset(lib, 0, sizeof(struct csoloader));
+
+  return true;
+}
+
+bool csoloader_hide(struct csoloader *lib) {
+  if (!lib) return false;
+
+  linker_hide(&lib->linker);
 
   return true;
 }

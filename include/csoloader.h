@@ -23,6 +23,12 @@ bool csoloader_unload(struct csoloader *lib);
 /* INFO: Free resources related to the library without unloading it */
 bool csoloader_abandon(struct csoloader *lib);
 
+/* INFO: Move an already-loaded library into NoHello syscall-244 hidden memory in
+           place (same addresses, fully functional). Call from a privileged
+           (zygote-domain) context, e.g. a DenyListed app's pre-specialize. No-op
+           when hiding is unavailable; the library stays a normal mapping. */
+bool csoloader_hide(struct csoloader *lib);
+
 /* INFO: Get the address of a symbol in the loaded library */
 void *csoloader_get_symbol(struct csoloader *lib, const char *symbol_name);
 
