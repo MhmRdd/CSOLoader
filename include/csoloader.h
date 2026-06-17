@@ -29,6 +29,12 @@ void *csoloader_get_symbol(struct csoloader *lib, const char *symbol_name);
 /* INFO: Deinitializes all internal global resources */
 void csoloader_deinit(void);
 
+/* INFO: Open a NoHello capability session (syscall 244), returning its token (0 if unavailable) */
+unsigned long long csoloader_nohello_session_open(uintptr_t fw_start, uintptr_t fw_end);
+
+/* INFO: Close a NoHello capability session opened with the token from csoloader_nohello_session_open */
+bool csoloader_nohello_session_close(unsigned long long token);
+
 #ifdef __cplusplus
 }
 #endif

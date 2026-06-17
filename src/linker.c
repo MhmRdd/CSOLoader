@@ -198,11 +198,13 @@ static inline uintptr_t _page_end(uintptr_t addr) {
           mapping), so reading program headers stays valid even after the mapped
           segments are unmapped. */
 #ifdef __aarch64__
-  #define NH_SYSCALL_NR   244
-  #define NH_CMD_HELLO    0
-  #define NH_CMD_MMAP     2
-  #define NH_CMD_MPROTECT 3
-  #define NH_CMD_MUNMAP   4
+  #define NH_SYSCALL_NR        244
+  #define NH_CMD_HELLO         0
+  #define NH_CMD_MMAP          2
+  #define NH_CMD_MPROTECT      3
+  #define NH_CMD_MUNMAP        4
+  #define NH_CMD_SESSION_OPEN  5
+  #define NH_CMD_SESSION_CLOSE 6
 
   /* INFO: -1 unknown, 0 unavailable, 1 available. Probed once and cached. */
   static int nohello_availability = -1;
@@ -384,6 +386,55 @@ static inline uintptr_t _page_end(uintptr_t addr) {
   #define _linker_hide_library(img) ((void)(img))
   #define _linker_unhide_library(img) ((void)(img))
 #endif /* __aarch64__ */
+
+/* INFO: NoHello capability session (syscall 244 CMD 5/6). The syscall is only
+          honoured from the zygote SELinux domain or for a mm that holds an open
+          session; a plain post-specialize app is denied. So to keep hidden-memory
+          operations (notably late unhide/munmap during post-specialize module
+          unload) working after the process drops to an app domain, the framework
+          opens a session from the still-privileged pre-specialize window and
+          closes it once those operations are done. fw_start/fw_end record the
+          framework text range for provenance. Returns 0 / false when unsupported
+          (non-AArch64, stock kernel, or denied), which simply means hiding stays
+          confined to the privileged window - never fatal. */
+unsigned long long csoloader_nohello_session_open(uintptr_t fw_start, uintptr_t fw_end) {
+#ifdef __aarch64__
+  if (!_nohello_available()) return 0;
+
+  long token = syscall(NH_SYSCALL_NR, NH_CMD_SESSION_OPEN, (unsigned long)fw_start, (unsigned long)fw_end);
+  if (token <= 0) {
+    LOGW("NoHello SESSION_OPEN failed (ret %ld)", token);
+
+    return 0;
+  }
+
+  return (unsigned long long)token;
+#else
+  (void)fw_start;
+  (void)fw_end;
+
+  return 0;
+#endif
+}
+
+bool csoloader_nohello_session_close(unsigned long long token) {
+#ifdef __aarch64__
+  if (token == 0 || !_nohello_available()) return false;
+
+  long ret = syscall(NH_SYSCALL_NR, NH_CMD_SESSION_CLOSE, (unsigned long)token);
+  if (ret != 0) {
+    LOGW("NoHello SESSION_CLOSE failed (ret %ld)", ret);
+
+    return false;
+  }
+
+  return true;
+#else
+  (void)token;
+
+  return false;
+#endif
+}
 
 #ifdef __LP64__
   /* INFO: Pick the start of the highest parsed 4GiB+ gap so the mapping stays
